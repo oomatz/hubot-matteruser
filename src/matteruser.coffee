@@ -126,7 +126,7 @@ class Matteruser extends Adapter
         postData.message = strings[0]
 
         # Set the comment relationship
-        postData.root_id = envelope.message.id
+        postData.root_id = envelope.message.mm.root_id or envelope.message.id
         postData.parent_id = postData.root_id
 
         postData.create_at = Date.now()
@@ -172,7 +172,9 @@ class Matteruser extends Adapter
           user.mm.dm_channel_id = mmPost.channel_id
         @robot.logger.debug 'Text: ' + text
 
-        @receive new TextMessage user, text, mmPost.id
+        textMessage = new TextMessage user, text, mmPost.id
+        textMessage.mm = mmPost
+        @receive textMessage
         @robot.logger.debug "Message sent to hubot brain."
         return true
 
