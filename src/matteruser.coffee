@@ -2,6 +2,11 @@
 
 MatterMostClient = require 'mattermost-client'
 
+class AttachmentMessage extends TextMessage
+
+    constructor: (@user, @text, @file_ids, @id) ->
+        super @user, @text, @id
+
 class Matteruser extends Adapter
 
     run: ->
@@ -12,6 +17,7 @@ class Matteruser extends Adapter
         mmWSSPort = process.env.MATTERMOST_WSS_PORT or '443'
         mmHTTPPort = process.env.MATTERMOST_HTTP_PORT or null
         @mmNoReply = process.env.MATTERMOST_REPLY == 'false'
+        @mmIgnoreUsers = process.env.MATTERMOST_IGNORE_USERS?.split(',') or []
 
         unless mmHost?
             @robot.logger.emergency "MATTERMOST_HOST is required"
@@ -156,6 +162,10 @@ class Matteruser extends Adapter
             @client.customMessage(postData, postData.channel_id)
 
     message: (msg) =>
+        if msg.data.sender_name in @mmIgnoreUsers
+          @robot.logger.info "User #{msg.data.sender_name} is in MATTERMOST_IGNORE_USERS, ignoring them."
+          return
+
         @robot.logger.debug msg
         mmPost = JSON.parse msg.data.post
         mmUser = @client.getUserByID mmPost.user_id
@@ -172,9 +182,12 @@ class Matteruser extends Adapter
           user.mm.dm_channel_id = mmPost.channel_id
         @robot.logger.debug 'Text: ' + text
 
-        textMessage = new TextMessage user, text, mmPost.id
-        textMessage.mm = mmPost
-        @receive textMessage
+        if mmPost.file_ids?
+            @receive new AttachmentMessage user, text, mmPost.file_ids, mmPost.id
+        else
+            textMessage = new TextMessage user, text, mmPost.id
+            textMessage.mm = mmPost
+            @receive textMessage
         @robot.logger.debug "Message sent to hubot brain."
         return true
 
@@ -182,14 +195,14 @@ class Matteruser extends Adapter
         mmUser = @client.getUserByID msg.data.user_id
         @userChange mmUser
         user = @robot.brain.userForId mmUser.id
-        user.room = msg.channel_id
+        user.room = msg.broadcast.channel_id
         @receive new EnterMessage user
         return true
 
     userRemoved: (msg) =>
         mmUser = @client.getUserByID msg.data.user_id
         user = @robot.brain.userForId mmUser.id
-        user.room = msg.channel_id
+        user.room = msg.broadcast.channel_id
         @receive new LeaveMessage user
         return true
 
