@@ -7,6 +7,40 @@ class AttachmentMessage extends TextMessage
     constructor: (@user, @text, @file_ids, @id) ->
         super @user, @text, @id
 
+# A TextMessage class that adds `msg.props` for Mattermost's properties.
+#
+# Text fields from message attachments are appended in @text for matching.
+# <https://docs.mattermost.com/developer/message-attachments.html>
+# The result is that `bot.hear()` will match against these attachment fields.
+#
+# As well, it is possible that some bot handlers could make use of other
+# fields on `msg.props`.
+#
+# Example raw props:
+#   {
+#       "attachments": [...],
+#       "from_webhook": "true",
+#       "override_username": "trenthere"
+#   }
+class TextAndPropsMessage extends TextMessage
+
+    constructor: (@user, @text, @props, @id) ->
+        @origText = @text
+        if @props.attachments?
+            separator = '\n\n--\n\n'
+            for attachment in @props.attachments
+                parts = []
+                for field in ['pretext', 'title', 'text']
+                    if attachment[field]
+                        parts.push(attachment[field])
+                if parts.length
+                    @text += separator + parts.join '\n\n'
+
+        super @user, @text, @id
+
+    match: (regex) ->
+        @text.match regex
+
 class Matteruser extends Adapter
 
     run: ->
@@ -42,6 +76,7 @@ class Matteruser extends Adapter
         @client.on 'profilesLoaded', @.profilesLoaded
         @client.on 'user_added', @.userAdded
         @client.on 'user_removed', @.userRemoved
+        @client.on 'typing', @.userTyping
         @client.on 'error', @.error
 
         @robot.brain.on 'loaded', @.brainLoaded
@@ -89,11 +124,10 @@ class Matteruser extends Adapter
     loggedIn: (user) =>
         @robot.logger.info 'Logged in as user "'+user.username+'" but not connected yet.'
         @self = user
-        @robot.name = @self.username
         return true
 
-    profilesLoaded: =>
-        for id, user of @client.users
+    profilesLoaded: (profiles) =>
+        for id, user of profiles
             @userChange user
 
     brainLoaded: =>
@@ -120,6 +154,7 @@ class Matteruser extends Adapter
 
         # Otherwise, create a new DM channel ID and message it.
         @client.getUserDirectMessageChannel user.id, (channel) =>
+            user.mm ?= {}
             user.mm.dm_channel_id = channel.id
             @client.postMessage(str, channel.id) for str in strings
 
@@ -135,7 +170,7 @@ class Matteruser extends Adapter
         postData.root_id = envelope.message.mm.root_id or envelope.message.id
         postData.parent_id = postData.root_id
 
-        postData.create_at = Date.now()
+        postData.create_at = 0
         postData.user_id = @self.id
         postData.filename = []
         # Check if the target room is also a user's username
@@ -157,6 +192,7 @@ class Matteruser extends Adapter
 
         # Otherwise, create a new DM channel ID and message it.
         @client.getUserDirectMessageChannel user.id, (channel) =>
+            user.mm ?= {}
             user.mm.dm_channel_id = channel.id
             postData.channel_id = channel.id
             @client.customMessage(postData, postData.channel_id)
@@ -174,16 +210,22 @@ class Matteruser extends Adapter
 
         user = @robot.brain.userForId mmPost.user_id
         user.room = mmPost.channel_id
-
+        user.room_name = msg.data.channel_display_name
+        user.channel_type = msg.data.channel_type
+        
         text = mmPost.message
         if msg.data.channel_type == 'D'
           if !///^@?#{@robot.name} ///i.test(text) # Direct message
             text = "#{@robot.name} #{text}"
+          user.mm ?= {}
           user.mm.dm_channel_id = mmPost.channel_id
         @robot.logger.debug 'Text: ' + text
 
         if mmPost.file_ids?
             @receive new AttachmentMessage user, text, mmPost.file_ids, mmPost.id
+        # If there are interesting props, then include them for bot handlers.
+        else if mmPost.props?.attachments?
+            @receive new TextAndPropsMessage user, text, mmPost.props, mmPost.id
         else
             textMessage = new TextMessage user, text, mmPost.id
             textMessage.mm = mmPost
@@ -191,23 +233,44 @@ class Matteruser extends Adapter
         @robot.logger.debug "Message sent to hubot brain."
         return true
 
-    userAdded: (msg) =>
-        mmUser = @client.getUserByID msg.data.user_id
-        @userChange mmUser
-        user = @robot.brain.userForId mmUser.id
-        user.room = msg.broadcast.channel_id
-        @receive new EnterMessage user
+    userTyping: (msg) =>
+        @robot.logger.info 'Someone is typing...'
         return true
 
+    userAdded: (msg) =>
+        # update channels when this bot is added to a new channel
+        if msg.data.user_id == @self.id
+          @client.loadChannels()
+        try
+          mmUser = @client.getUserByID msg.data.user_id
+          @userChange mmUser
+          user = @robot.brain.userForId mmUser.id
+          user.room = msg.broadcast.channel_id
+          @receive new EnterMessage user
+          return true
+        catch error
+          return false
+
     userRemoved: (msg) =>
-        mmUser = @client.getUserByID msg.data.user_id
-        user = @robot.brain.userForId mmUser.id
-        user.room = msg.broadcast.channel_id
-        @receive new LeaveMessage user
-        return true
+        # update channels when this bot is removed from a channel
+        if msg.broadcast.user_id == @self.id
+          @client.loadChannels()
+        try
+          mmUser = @client.getUserByID msg.data.user_id
+          user = @robot.brain.userForId mmUser.id
+          user.room = msg.broadcast.channel_id
+          @receive new LeaveMessage user
+          return true
+        catch error
+          return false
 
     slackAttachmentMessage: (data) =>
         return unless data.room
+
+        # Convert data.room to channel_id in case it's a room name
+        channelInfo = @client.findChannelByName(data.room)
+        if channelInfo != null
+            data.room = channelInfo.id
         msg = {}
         msg.text = data.text
         msg.type = "slack_attachment"
